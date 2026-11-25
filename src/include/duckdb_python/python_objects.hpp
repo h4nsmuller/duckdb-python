@@ -43,38 +43,6 @@ enum class PyDecimalExponentType {
 };
 
 struct PyDecimal {
-
-	struct PyDecimalScaleConverter {
-		template <typename T, typename = std::enable_if<std::numeric_limits<T>::is_integer, T>>
-		static Value Operation(bool signed_value, vector<uint8_t> &digits, uint8_t width, uint8_t scale) {
-			T value = 0;
-			for (auto it = digits.begin(); it != digits.end(); it++) {
-				value = value * 10 + *it;
-			}
-			if (signed_value) {
-				value = -value;
-			}
-			return Value::DECIMAL(value, width, scale);
-		}
-	};
-
-	struct PyDecimalPowerConverter {
-		template <typename T, typename = std::enable_if<std::numeric_limits<T>::is_integer, T>>
-		static Value Operation(bool signed_value, vector<uint8_t> &digits, uint8_t width, uint8_t exponent) {
-			T value = 0;
-			for (auto &digit : digits) {
-				value = value * 10 + digit;
-			}
-			for (idx_t i = 0; i < exponent; i++) {
-				value *= 10;
-			}
-			if (signed_value) {
-				value = -value;
-			}
-			return Value::DECIMAL(value, width, 0);
-		}
-	};
-
 public:
 	PyDecimal(nb::handle &obj);
 	vector<uint8_t> digits;
@@ -84,8 +52,12 @@ public:
 	int64_t exponent_value;
 
 public:
-	bool TryGetType(LogicalType &type);
-	Value ToDuckValue();
+	//! The type and the value a decimal.Decimal converts to. A finite value is an exact DECIMAL of the width and
+	//! scale it needs, at any width within the max_decimal_width of the session (the default of the setting without
+	//! a context); a wider one is an error naming the limit, except where the setting is 38, which keeps the
+	//! pre-wide fallback to DOUBLE. NaN and Infinity have no DECIMAL form and are FLOAT
+	bool TryGetType(optional_ptr<ClientContext> context, LogicalType &type);
+	Value ToDuckValue(optional_ptr<ClientContext> context);
 
 private:
 	void SetExponent(nb::handle &exponent);

@@ -1,6 +1,7 @@
 #include "duckdb_python/numpy/array_wrapper.hpp"
 #include "duckdb/common/types/date.hpp"
 #include "duckdb/common/types/hugeint.hpp"
+#include "duckdb/common/types/bignum_decimal.hpp"
 #include "duckdb/common/types/time.hpp"
 #include "duckdb/common/types/timestamp.hpp"
 #include "utf8proc_wrapper.hpp"
@@ -548,9 +549,39 @@ static bool ConvertDecimalInternal(NumpyAppendData &append_data, double division
 	}
 }
 
+//! A DECIMAL of more than 38 digits, whose unscaled values are BIGNUM blobs: a float64 like the narrower decimals,
+//! each value rounded once to the nearest double (infinite beyond the range of a double)
+static bool ConvertWideDecimal(NumpyAppendData &append_data, uint32_t scale) {
+	auto target_offset = append_data.target_offset;
+	auto target_mask = append_data.target_mask;
+	auto &idata = append_data.idata;
+	auto count = append_data.count;
+	auto source_offset = append_data.source_offset;
+
+	auto src_ptr = UnifiedVectorFormat::GetData<string_t>(idata);
+	auto out_ptr = reinterpret_cast<double *>(append_data.target_data);
+	bool requires_mask = false;
+	for (idx_t i = 0; i < count; i++) {
+		idx_t src_idx = idata.sel->get_index(i + source_offset);
+		idx_t offset = target_offset + i;
+		if (!idata.validity.RowIsValid(src_idx)) {
+			out_ptr[offset] = 0;
+			requires_mask = true;
+			target_mask[offset] = true;
+		} else {
+			out_ptr[offset] = DecimalHelper<bignum_t>::ToDouble(bignum_t(src_ptr[src_idx]), scale);
+			target_mask[offset] = false;
+		}
+	}
+	return requires_mask;
+}
+
 static bool ConvertDecimal(NumpyAppendData &append_data) {
 	auto &decimal_type = append_data.input.GetType();
 	auto dec_scale = DecimalType::GetScale(decimal_type);
+	if (Decimal::IsWide(DecimalType::GetWidth(decimal_type))) {
+		return ConvertWideDecimal(append_data, dec_scale);
+	}
 	double division = pow(10, dec_scale);
 	switch (decimal_type.InternalType()) {
 	case PhysicalType::INT16:

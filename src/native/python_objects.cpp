@@ -8,6 +8,7 @@
 #include "duckdb_python/pyconnection/pyconnection.hpp"
 #include "duckdb/common/operator/add.hpp"
 #include "duckdb/common/types/bignum.hpp"
+#include "duckdb/common/types/bignum_decimal.hpp"
 #include "duckdb/function/to_interval.hpp"
 
 #include <duckdb/common/types/variant.hpp>
@@ -124,53 +125,65 @@ PyDecimal::PyDecimal(nb::handle &obj) : obj(obj) {
 	}
 }
 
-struct DecimalWidthScale {
-	int32_t width = 0;
-	int64_t scale = 0;
-	bool fits = false;
+//! The DECIMAL a finite decimal.Decimal is held in exactly
+struct DecimalShape {
+	enum class Tier : uint8_t {
+		FIXED,  //! at most 38 digits, a fixed-size integer
+		WIDE,   //! more than 38 digits, within the limit of the session
+		DOUBLE, //! more than 38 digits where max_decimal_width is 38: the fallback of the pre-wide types
+	};
+	uint32_t width = 0;
+	uint32_t scale = 0;
+	Tier tier = Tier::FIXED;
 };
 
-static DecimalWidthScale ComputeDecimalWidthScale(idx_t digit_count, PyDecimalExponentType exponent_type,
-                                                  int64_t exponent_value) {
-	DecimalWidthScale result;
-
-	if (digit_count > Decimal::MAX_WIDTH_DECIMAL) {
-		return result;
-	}
-
+static DecimalShape ComputeDecimalShape(optional_ptr<ClientContext> context, idx_t digit_count,
+                                        PyDecimalExponentType exponent_type, int64_t exponent_value) {
+	D_ASSERT(exponent_value >= 0);
+	// The exponent of a decimal.Decimal is bounded by 10^18 and its digits by the memory of the process, so neither
+	// sum overflows
+	idx_t width;
+	idx_t scale;
 	if (exponent_type == PyDecimalExponentType::EXPONENT_POWER) {
-		if (exponent_value > Decimal::MAX_WIDTH_DECIMAL - digit_count) {
+		width = digit_count + static_cast<idx_t>(exponent_value);
+		scale = 0;
+	} else {
+		scale = static_cast<idx_t>(exponent_value);
+		// a fraction holding fewer digits than its scale has an integer digit too
+		width = scale > digit_count ? scale + 1 : digit_count;
+	}
+	DecimalShape result;
+	if (width > Decimal::MAX_WIDTH_INT128) {
+		// Without a session the value is typed within the default of the setting
+		auto limit = context ? DecimalWidthLimit::FromSetting(context)
+		                     : DecimalWidthLimit(Decimal::DEFAULT_MAX_WIDTH,
+		                                         "the default of max_decimal_width, no session is at hand");
+		if (width > limit.width && limit.width == Decimal::MAX_WIDTH_INT128) {
+			result.tier = DecimalShape::Tier::DOUBLE;
 			return result;
 		}
-		result.width = static_cast<int32_t>(digit_count) + static_cast<int32_t>(exponent_value);
-		result.scale = 0;
-		result.fits = true;
-		return result;
+		if (width > limit.width) {
+			throw OutOfRangeException("Converting a Python decimal.Decimal needs a DECIMAL of %llu digits, the "
+			                          "maximum DECIMAL width is %u (%s)",
+			                          width, limit.width, limit.hint);
+		}
+		result.tier = DecimalShape::Tier::WIDE;
 	}
-
-	result.scale = exponent_value;
-	if (result.scale > Decimal::MAX_WIDTH_INT128) {
-		return result;
-	}
-
-	result.width = static_cast<int32_t>(digit_count);
-	if (result.scale > result.width) {
-		result.width = static_cast<int32_t>(result.scale) + 1; // add 1 for the non-decimal values
-	}
-	result.fits = result.width <= Decimal::MAX_WIDTH_INT128;
+	result.width = NumericCast<uint32_t>(width);
+	result.scale = NumericCast<uint32_t>(scale);
 	return result;
 }
 
-bool PyDecimal::TryGetType(LogicalType &type) {
+bool PyDecimal::TryGetType(optional_ptr<ClientContext> context, LogicalType &type) {
 	switch (exponent_type) {
 	case PyDecimalExponentType::EXPONENT_SCALE:
 	case PyDecimalExponentType::EXPONENT_POWER: {
-		auto ws = ComputeDecimalWidthScale(digits.size(), exponent_type, exponent_value);
-		if (!ws.fits) {
+		auto shape = ComputeDecimalShape(context, digits.size(), exponent_type, exponent_value);
+		if (shape.tier == DecimalShape::Tier::DOUBLE) {
 			type = LogicalType::DOUBLE;
 			return true;
 		}
-		type = LogicalType::DECIMAL(ws.width, static_cast<uint8_t>(ws.scale));
+		type = LogicalType::DECIMAL(shape.width, shape.scale);
 		return true;
 	}
 	case PyDecimalExponentType::EXPONENT_INFINITY: {
@@ -218,21 +231,57 @@ void PyDecimal::SetExponent(nb::handle &exponent) {
 	// LCOV_EXCL_STOP
 }
 
-template <class OP>
-Value PyDecimalCastSwitch(PyDecimal &decimal, uint8_t width, uint8_t scale) {
-	if (width > DecimalWidth<int64_t>::max) {
-		return OP::template Operation<hugeint_t>(decimal.signed_value, decimal.digits, width, scale);
+//! The unscaled value of a decimal of at most 38 digits: the digits, followed by `zeros` zero digits
+template <class T>
+static T FixedUnscaledValue(const vector<uint8_t> &digits, bool negative, idx_t zeros) {
+	T value = 0;
+	for (auto digit : digits) {
+		value = value * 10 + digit;
 	}
-	if (width > DecimalWidth<int32_t>::max) {
-		return OP::template Operation<int64_t>(decimal.signed_value, decimal.digits, width, scale);
+	for (idx_t i = 0; i < zeros; i++) {
+		value *= 10;
 	}
-	if (width > DecimalWidth<int16_t>::max) {
-		return OP::template Operation<int32_t>(decimal.signed_value, decimal.digits, width, scale);
-	}
-	return OP::template Operation<int16_t>(decimal.signed_value, decimal.digits, width, scale);
+	return negative ? -value : value;
 }
 
-// Wont fit in a DECIMAL, fall back to DOUBLE
+static Value FixedDecimalValue(const PyDecimal &decimal, const DecimalShape &shape, idx_t zeros) {
+	auto &digits = decimal.digits;
+	auto negative = decimal.signed_value;
+	if (shape.width > DecimalWidth<int64_t>::max) {
+		return Value::DECIMAL(FixedUnscaledValue<hugeint_t>(digits, negative, zeros), shape.width, shape.scale);
+	}
+	if (shape.width > DecimalWidth<int32_t>::max) {
+		return Value::DECIMAL(FixedUnscaledValue<int64_t>(digits, negative, zeros), shape.width, shape.scale);
+	}
+	if (shape.width > DecimalWidth<int16_t>::max) {
+		return Value::DECIMAL(FixedUnscaledValue<int32_t>(digits, negative, zeros), shape.width, shape.scale);
+	}
+	return Value::DECIMAL(FixedUnscaledValue<int16_t>(digits, negative, zeros), shape.width, shape.scale);
+}
+
+//! A decimal of more than 38 digits: its unscaled value as a BIGNUM, read from the digits
+static Value WideDecimalValue(optional_ptr<ClientContext> context, const PyDecimal &decimal, const DecimalShape &shape,
+                              idx_t zeros) {
+	// The digits of the unscaled value without leading zeros, so that every value has one text
+	string text;
+	auto first = std::find_if(decimal.digits.begin(), decimal.digits.end(), [](uint8_t digit) { return digit != 0; });
+	if (first == decimal.digits.end()) {
+		text = "0";
+	} else {
+		text.reserve(static_cast<idx_t>(decimal.digits.end() - first) + zeros + 1);
+		if (decimal.signed_value) {
+			text += '-';
+		}
+		for (auto digit = first; digit != decimal.digits.end(); ++digit) {
+			text += static_cast<char>('0' + *digit);
+		}
+		text.append(zeros, '0');
+	}
+	auto unscaled = Bignum::VarcharToBignum(string_t(text.c_str(), UnsafeNumericCast<uint32_t>(text.size())), context);
+	return Value::DECIMAL(DecimalHelper<bignum_t>::Load(unscaled), shape.width, shape.scale);
+}
+
+// max_decimal_width is 38 and the value needs more: the DOUBLE of the pre-wide types
 static Value CastToDouble(nb::handle &obj) {
 	string converted = nb::cast<std::string>(nb::str(obj));
 	string_t decimal_string(converted);
@@ -243,21 +292,21 @@ static Value CastToDouble(nb::handle &obj) {
 	return Value::DOUBLE(double_val);
 }
 
-Value PyDecimal::ToDuckValue() {
+Value PyDecimal::ToDuckValue(optional_ptr<ClientContext> context) {
 	switch (exponent_type) {
-	case PyDecimalExponentType::EXPONENT_SCALE: {
-		auto ws = ComputeDecimalWidthScale(digits.size(), exponent_type, exponent_value);
-		if (!ws.fits) {
-			return CastToDouble(obj);
-		}
-		return PyDecimalCastSwitch<PyDecimalScaleConverter>(*this, ws.width, static_cast<uint8_t>(ws.scale));
-	}
+	case PyDecimalExponentType::EXPONENT_SCALE:
 	case PyDecimalExponentType::EXPONENT_POWER: {
-		auto ws = ComputeDecimalWidthScale(digits.size(), exponent_type, exponent_value);
-		if (!ws.fits) {
+		auto shape = ComputeDecimalShape(context, digits.size(), exponent_type, exponent_value);
+		// a positive exponent is that many zero digits behind the digits of the value
+		auto zeros = exponent_type == PyDecimalExponentType::EXPONENT_POWER ? static_cast<idx_t>(exponent_value) : 0;
+		switch (shape.tier) {
+		case DecimalShape::Tier::FIXED:
+			return FixedDecimalValue(*this, shape, zeros);
+		case DecimalShape::Tier::WIDE:
+			return WideDecimalValue(context, *this, shape, zeros);
+		default:
 			return CastToDouble(obj);
 		}
-		return PyDecimalCastSwitch<PyDecimalPowerConverter>(*this, ws.width, static_cast<uint8_t>(exponent_value));
 	}
 	case PyDecimalExponentType::EXPONENT_NAN: {
 		return Value::FLOAT(NAN);

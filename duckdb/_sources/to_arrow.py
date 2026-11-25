@@ -159,7 +159,8 @@ def _engine_type(kind: pa.DataType) -> str | None:
         return _NAIVE_TIMESTAMPS.get(kind.unit)
     if pa.types.is_timestamp(kind) and kind.unit in _PER_SECOND:
         return "TIMESTAMP WITH TIME ZONE"
-    if pa.types.is_decimal128(kind):
+    # A decimal256 is the engine's DECIMAL of the same precision, a wide one above 38 digits.
+    if pa.types.is_decimal128(kind) or pa.types.is_decimal256(kind):
         return f"DECIMAL({kind.precision},{kind.scale})"
     return None
 

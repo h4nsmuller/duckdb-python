@@ -584,6 +584,26 @@ class TestArrowDecimals:
         table = arrow_table([D("99999999.99"), None], pa.decimal128(10, 2))
         assert arrow_ids(table, cmp("=", "c", D("99999999.99"), "DECIMAL(10,2)")) == [0]
 
+    @pytest.mark.parametrize("encoded", ENCODED)
+    @pytest.mark.parametrize(("precision", "scale"), [(10, 2), (38, 10), (39, 2), (76, 10)])
+    def test_decimal256_comparisons_and_membership(self, encoded, precision, scale):
+        kind = pa.decimal256(precision, scale)
+        array = dictionary(self.VALUES, kind) if encoded else pa.array(self.VALUES, kind)
+        table = pa.table({"id": [0, 1, 2], "c": array})
+        type_text = f"DECIMAL({precision},{scale})"
+        assert arrow_ids(table, cmp(">", "c", D("1.25"), type_text)) == [1]
+        assert arrow_ids(table, cmp("=", "c", D("2.5"), type_text)) == [1]
+        assert arrow_ids(table, isin("c", type_text, D("2.5000"))) == [1]
+        assert arrow_ids(table, negate(isin("c", type_text, D("1.25")))) == [1]
+
+    def test_the_widest_decimal256_value_is_held(self):
+        widest = D("9" * 66 + "." + "9" * 10)
+        table = arrow_table([widest, D("-" + str(widest)), None], pa.decimal256(76, 10))
+        assert arrow_ids(table, cmp("=", "c", widest, "DECIMAL(76,10)")) == [0]
+        assert arrow_ids(table, cmp("<", "c", widest, "DECIMAL(76,10)")) == [1]
+        refused_by_arrow(table.schema, cmp(">", "c", D("1" + "0" * 66), "DECIMAL(76,10)"))
+        refused_by_arrow(table.schema, cmp(">", "c", D("1.25"), "DECIMAL(76,2)"))
+
     @pytest.mark.parametrize(
         "kind", [pytest.param(pa.decimal32(5, 2), id="32-bit"), pytest.param(pa.decimal64(15, 2), id="64-bit")]
     )

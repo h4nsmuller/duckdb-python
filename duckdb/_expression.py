@@ -531,8 +531,16 @@ def _value_type(value: object) -> str | None:
     return None
 
 
+# The widest DECIMAL a value is written as: the default of the engine's max_decimal_width setting.
+_MAX_DECIMAL_WIDTH = 1_000_000
+
+
 def _decimal_shape(value: decimal.Decimal) -> tuple[int, int] | None:
-    """The width and scale of the DECIMAL that holds `value` exactly, or None when no DECIMAL(38) can."""
+    """The width and scale of the DECIMAL that holds `value` exactly, or None when no DECIMAL does.
+
+    None is a NaN or an infinity, and a value of more digits than the engine's default limit, which the engine
+    module's conversion refuses by name.
+    """
     if not value.is_finite():
         return None
     # Width and scale come from the value, as the parameter path reads them: a bare DECIMAL is DECIMAL(18,3) and
@@ -544,7 +552,7 @@ def _decimal_shape(value: decimal.Decimal) -> tuple[int, int] | None:
     else:
         scale = -places
         width = scale + 1 if scale > len(digits) else len(digits)
-    return (width, scale) if len(digits) <= 38 and width <= 38 else None
+    return (width, scale) if width <= _MAX_DECIMAL_WIDTH else None
 
 
 def render_literal(value: object) -> str:
@@ -614,7 +622,8 @@ def _rendered(value: object) -> str:
     if isinstance(value, decimal.Decimal):
         shape = _decimal_shape(value)
         if shape is None:
-            # No DECIMAL holds it, so it is what binding it as a parameter makes of it, a DOUBLE or a FLOAT.
+            # No DECIMAL holds it, so it is what binding it as a parameter makes of it: a FLOAT for a NaN or an
+            # infinity, an error for a value beyond the widest DECIMAL.
             return _seam.value_literal(value)
         width, scale = shape
         # Written out in full: DuckDB reads '1E-38' as a decimal string only into a type one digit wider.

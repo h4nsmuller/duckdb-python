@@ -23,9 +23,12 @@ WIDTH_38_BOUNDARY = [
     (Decimal("9" * 38), "DECIMAL(38,0)", Decimal("9" * 38)),
     (Decimal("0." + "1" * 38), "DECIMAL(38,38)", Decimal("0." + "1" * 38)),
     (Decimal("1E-37"), "DECIMAL(38,37)", Decimal("1E-37")),
-    (Decimal("9" * 39), "DOUBLE", float(Decimal("9" * 39))),
-    (Decimal("1E-38"), "DOUBLE", float(Decimal("1E-38"))),
+    # past the 38 digits of the fixed-size tiers a decimal is a wide DECIMAL, never a DOUBLE
+    (Decimal("9" * 39), "DECIMAL(39,0)", Decimal("9" * 39)),
+    (Decimal("1E-38"), "DECIMAL(39,38)", Decimal("1E-38")),
 ]
+
+BEYOND_MAX_DECIMAL_WIDTH = r"the maximum DECIMAL width is 1000000 \(SET max_decimal_width to allow wider decimals\)"
 
 
 class TestDecimalPositiveExponent:
@@ -69,30 +72,32 @@ class TestDecimalPositiveExponent:
     @pytest.mark.parametrize(
         ("value", "expected_type"),
         [
-            (Decimal("1E+38"), "DOUBLE"),
-            (Decimal("1E+39"), "DOUBLE"),
-            (Decimal("12E+37"), "DOUBLE"),
-            (Decimal("123E+36"), "DOUBLE"),
-            (Decimal("1E+255"), "DOUBLE"),
+            (Decimal("1E+38"), "DECIMAL(39,0)"),
+            (Decimal("1E+39"), "DECIMAL(40,0)"),
+            (Decimal("12E+37"), "DECIMAL(39,0)"),
+            (Decimal("123E+36"), "DECIMAL(39,0)"),
+            (Decimal("1E+255"), "DECIMAL(256,0)"),
         ],
     )
-    def test_overflow_to_double(self, duckdb_cursor, value, expected_type):
+    def test_past_38_digits_is_a_wide_decimal(self, duckdb_cursor, value, expected_type):
         result_value, result_type = duckdb_cursor.execute("SELECT ?, typeof(?)", [value, value]).fetchone()
-        assert result_type == expected_type, f"Type should be DOUBLE for {value}"
-        assert result_value == float(value), f"Value should match float for {value}"
+        assert result_type == expected_type, f"Type mismatch for {value}"
+        assert isinstance(result_value, Decimal)
+        assert result_value == value, f"Value should be exact for {value}"
 
     @pytest.mark.parametrize(
-        "value",
+        ("value", "expected_type"),
         [
-            Decimal("1E+256"),
-            Decimal("1E+257"),
-            Decimal("1" * 40 + "E-2"),
+            (Decimal("1E+256"), "DECIMAL(257,0)"),
+            (Decimal("1E+257"), "DECIMAL(258,0)"),
+            (Decimal("1" * 40 + "E-2"), "DECIMAL(40,2)"),
         ],
     )
-    def test_large_exponent_type_value_agreement(self, duckdb_cursor, value):
+    def test_large_exponent_type_value_agreement(self, duckdb_cursor, value, expected_type):
         result_value, result_type = duckdb_cursor.execute("SELECT ?, typeof(?)", [value, value]).fetchone()
-        assert result_type == "DOUBLE", f"Type should be DOUBLE for {value}"
-        assert result_value == float(value), f"Value should match float for {value}"
+        assert result_type == expected_type, f"Type mismatch for {value}"
+        assert isinstance(result_value, Decimal)
+        assert result_value == value, f"Value should be exact for {value}"
 
     @pytest.mark.parametrize(
         ("input_str", "should_raise"),
@@ -199,8 +204,8 @@ class TestDecimalPositiveExponent:
         result_value, result_type = duckdb_cursor.execute("SELECT v, typeof(v) FROM _").fetchone()
         typeof_result = duckdb_cursor.execute("SELECT typeof(?)", [Decimal("1E+256")]).fetchone()[0]
         assert result_type == typeof_result, f"Type disagreement: scan={result_type} vs typeof={typeof_result}"
-        assert result_type == "DOUBLE", "Type should be DOUBLE for 1E+256"
-        assert result_value == float(Decimal("1E+256")), "Value should match float for 1E+256"
+        assert result_type == "DECIMAL(257,0)", "Type should be DECIMAL(257,0) for 1E+256"
+        assert result_value == Decimal("1E+256"), "Value should be exact for 1E+256"
 
     def test_udf_return_value(self, duckdb_cursor):
         duckdb_cursor.create_function("test_udf", lambda x: Decimal("1E+2"), return_type="DECIMAL(10,0)")
@@ -258,29 +263,42 @@ class TestDecimalPositiveExponent:
         assert result_inf == float("inf"), "Infinity value mismatch"
 
     @pytest.mark.parametrize(
-        ("value", "expected_type", "expected_value"),
+        "value",
         [
-            (Decimal("1E+2147483647"), "DOUBLE", float("inf")),
-            (Decimal("1E-2147483647"), "DOUBLE", 0.0),
+            Decimal("1E+2147483647"),
+            Decimal("1E-2147483647"),
+            Decimal("1E+3000000000"),
+            Decimal("1E-3000000000"),
+            Decimal("1E-2147483648"),
+            Decimal("1E+1000000"),
+            Decimal("1E-1000000"),
         ],
     )
-    def test_exponent_at_int32_limits(self, duckdb_cursor, value, expected_type, expected_value):
-        result_value, result_type = duckdb_cursor.execute("SELECT ?, typeof(?)", [value, value]).fetchone()
-        assert result_type == expected_type, f"Type mismatch for {value}"
-        assert result_value == expected_value, f"Value mismatch for {value}"
+    def test_exponent_beyond_max_decimal_width(self, duckdb_cursor, value):
+        # No DECIMAL of the session holds these, and no DOUBLE stands in for one
+        with pytest.raises(duckdb.OutOfRangeException, match=BEYOND_MAX_DECIMAL_WIDTH):
+            duckdb_cursor.execute("SELECT ?, typeof(?)", [value, value])
 
     @pytest.mark.parametrize(
-        ("value", "expected_type", "expected_value"),
+        ("value", "expected_type"),
         [
-            (Decimal("1E+3000000000"), "DOUBLE", float("inf")),
-            (Decimal("1E-3000000000"), "DOUBLE", 0.0),
-            (Decimal("1E-2147483648"), "DOUBLE", 0.0),
+            (Decimal("1E+999"), "DECIMAL(1000,0)"),
+            (Decimal("1E-999"), "DECIMAL(1000,999)"),
+            (Decimal("1E-999999"), "DECIMAL(1000000,999999)"),
         ],
     )
-    def test_exponent_beyond_int32_range(self, duckdb_cursor, value, expected_type, expected_value):
+    def test_exponent_at_max_decimal_width(self, duckdb_cursor, value, expected_type):
+        if expected_type != "DECIMAL(1000000,999999)":
+            duckdb_cursor.execute("SET max_decimal_width = 1000")
         result_value, result_type = duckdb_cursor.execute("SELECT ?, typeof(?)", [value, value]).fetchone()
-        assert result_type == expected_type, f"Type should be {expected_type} for {value}"
-        assert result_value == expected_value, f"Value should be {expected_value} for {value}"
+        assert result_type == expected_type, f"Type mismatch for {value}"
+        assert result_value == value, f"Value should be exact for {value}"
+
+    @pytest.mark.parametrize("value", [Decimal("1E+1000"), Decimal("1E-1000")])
+    def test_exponent_beyond_a_lowered_max_decimal_width(self, duckdb_cursor, value):
+        duckdb_cursor.execute("SET max_decimal_width = 1000")
+        with pytest.raises(duckdb.OutOfRangeException, match=r"needs a DECIMAL of 1001 digits, the maximum DECIMAL"):
+            duckdb_cursor.execute("SELECT ?, typeof(?)", [value, value])
 
     @pytest.mark.parametrize(("value", "expected_type", "expected_value"), WIDTH_38_BOUNDARY)
     def test_38_boundary(self, duckdb_cursor, value, expected_type, expected_value):
@@ -301,12 +319,9 @@ class TestDecimalPositiveExponent:
         ("value", "expected_type", "expected_value"),
         [
             (Decimal("1E+37"), "DECIMAL(38,0)", Decimal("1E+37")),
-            (Decimal("1E+38"), "DOUBLE", float(Decimal("1E+38"))),
-            (Decimal("1E+256"), "DOUBLE", float(Decimal("1E+256"))),
-            (Decimal("1E+257"), "DOUBLE", float(Decimal("1E+257"))),
-            (Decimal("1E+2147483647"), "DOUBLE", float("inf")),
-            (Decimal("1E+3000000000"), "DOUBLE", float("inf")),
-            (Decimal("1E-2147483648"), "DOUBLE", 0.0),
+            (Decimal("1E+38"), "DECIMAL(39,0)", Decimal("1E+38")),
+            (Decimal("1E+256"), "DECIMAL(257,0)", Decimal("1E+256")),
+            (Decimal("1E+257"), "DECIMAL(258,0)", Decimal("1E+257")),
         ],
     )
     def test_pandas_object_column_at_limits(self, duckdb_cursor, value, expected_type, expected_value):
@@ -315,11 +330,20 @@ class TestDecimalPositiveExponent:
         assert result_type == expected_type, f"Type mismatch for {value}"
         assert result_value == expected_value, f"Value mismatch for {value}"
 
+    @pytest.mark.skipif(not can_test_pandas, reason="pandas not available")
+    @pytest.mark.parametrize(
+        "value", [Decimal("1E+2147483647"), Decimal("1E+3000000000"), Decimal("1E-2147483648"), Decimal("1E+1000000")]
+    )
+    def test_pandas_object_column_beyond_max_decimal_width(self, duckdb_cursor, value):
+        _ = pd.DataFrame({"v": pd.Series([value], dtype=object)})
+        with pytest.raises(duckdb.OutOfRangeException, match=BEYOND_MAX_DECIMAL_WIDTH):
+            duckdb_cursor.execute("SELECT v, typeof(v) FROM _").fetchone()
+
     @pytest.mark.parametrize(
         ("value", "expected_type", "expected_value"),
         [
-            (Decimal("1E-256"), "DOUBLE", float(Decimal("1E-256"))),
-            (Decimal("1E-257"), "DOUBLE", float(Decimal("1E-257"))),
+            (Decimal("1E-256"), "DECIMAL(257,256)", Decimal("1E-256")),
+            (Decimal("1E-257"), "DECIMAL(258,257)", Decimal("1E-257")),
         ],
     )
     def test_negative_exponent_256_plus(self, duckdb_cursor, value, expected_type, expected_value):
@@ -346,11 +370,24 @@ class TestDecimalPositiveExponent:
         assert result_type == "FLOAT", "Type should be FLOAT for -Infinity"
         assert result_value == float("-inf"), "Value should be -inf for -Infinity"
 
-    def test_subclass_custom_str_raises(self, duckdb_cursor):
+    def test_subclass_custom_str_is_not_read(self, duckdb_cursor):
         class CustomDecimal(Decimal):
             def __str__(self) -> str:
                 return "$1E+40"
 
+        # The digits and the exponent of the value convert, at any width, not its text
+        value = CustomDecimal("1E+40")
+        result_value, result_type = duckdb_cursor.execute("SELECT ?, typeof(?)", [value, value]).fetchone()
+        assert result_type == "DECIMAL(41,0)"
+        assert result_value == Decimal("1E+40")
+
+    def test_subclass_custom_str_raises_where_the_text_converts(self, duckdb_cursor):
+        class CustomDecimal(Decimal):
+            def __str__(self) -> str:
+                return "$1E+40"
+
+        # With max_decimal_width at 38 a decimal of more digits is still a DOUBLE, read from its text
+        duckdb_cursor.execute("SET max_decimal_width = 38")
         value = CustomDecimal("1E+40")
         with pytest.raises(duckdb.InvalidInputException, match="Failed to convert Decimal value to DOUBLE"):
             duckdb_cursor.execute("SELECT ?", [value])

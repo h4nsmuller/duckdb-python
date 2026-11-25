@@ -217,12 +217,15 @@ class TestDecimalsTheParameterPathHolds:
 
 
 class TestDecimalWidthAtTheEdges:
-    """The width counts the leading zero of a fraction as the parameter path does, and past 38 the value is DOUBLE."""
+    """The width counts the leading zero of a fraction as the parameter path does, also past 38 digits."""
 
     @pytest.mark.parametrize(
         ("text", "kind"),
         [
-            pytest.param("1e-38", "DOUBLE", id="smallest_scale_38"),
+            pytest.param("1e-38", "DECIMAL(39,38)", id="smallest_scale_38"),
+            pytest.param("9" * 39, "DECIMAL(39,0)", id="integral_past_38"),
+            pytest.param("-0." + "9" * 39, "DECIMAL(39,39)", id="fraction_past_38"),
+            pytest.param("1e+300", "DECIMAL(301,0)", id="positive_exponent"),
             pytest.param("9" * 38, "DECIMAL(38,0)", id="largest_integral"),
             pytest.param("0." + "9" * 38, "DECIMAL(38,38)", id="largest_fraction"),
         ],

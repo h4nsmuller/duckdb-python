@@ -95,6 +95,32 @@ def _error(kind: type[Exception], message: str) -> Exception:
     return kind(f"{prefix} Error: {message}" if prefix else message)
 
 
+def _refuse_wide_decimals_for_polars(schema: Any) -> None:  # noqa: ANN401
+    """Refuse an Arrow schema holding a decimal256 at any depth, which Polars cannot read.
+
+    A Polars decimal holds at most 38 digits and Polars aborts on a decimal256, so the column is named here instead.
+    """
+    import pyarrow as pa
+
+    for column in schema:
+        pending = [column.type]
+        while pending:
+            kind = pending.pop()
+            if pa.types.is_decimal256(kind):
+                message = (
+                    f"Cannot convert the result to Polars: column {quote(column.name)} is exported to Arrow as "
+                    f"{kind}, which Polars does not read: a Polars decimal holds at most 38 digits. Cast the column "
+                    "to a DECIMAL of at most 38 digits, to DOUBLE or to VARCHAR."
+                )
+                raise _error(_duckdb.NotImplementedException, message)
+            if pa.types.is_dictionary(kind):
+                pending.append(kind.value_type)
+            elif isinstance(kind, pa.BaseExtensionType):
+                pending.append(kind.storage_type)
+            else:
+                pending.extend(kind.field(i).type for i in range(kind.num_fields))
+
+
 def _name_text(name: str) -> str:
     """A name written so SQL folds its case when it is a plain identifier, quoted otherwise."""
     return name if _BARE_NAME.match(name) and fold_name(name) not in KEYWORDS else quote(name)
@@ -2561,6 +2587,7 @@ class DuckDBPyRelation:
 
         if not lazy:
             table = self._submit("arrow", int(batch_size)).arrow_table(to_polars=True)
+            _refuse_wide_decimals_for_polars(table.schema)
             return polars.from_arrow(table, rechunk=False)
         from duckdb.polars_io import duckdb_source
 
@@ -2568,7 +2595,9 @@ class DuckDBPyRelation:
         # reads it that way too and its rows carry the names the schema promises.
         text = _wrap(_render(self, literals=True)[0], _unnamed())
         unique = DuckDBPyRelation._make(self._con, Sql(text), alias=_unnamed(), handles=(self,))
-        schema = polars.DataFrame(_seam.arrow_schema(self._con, unique.columns, unique.types).empty_table()).schema
+        arrow_schema = _seam.arrow_schema(self._con, unique.columns, unique.types)
+        _refuse_wide_decimals_for_polars(arrow_schema)
+        schema = polars.DataFrame(arrow_schema.empty_table()).schema
         return duckdb_source(unique, schema)
 
     def to_dicts(self) -> builtins.list[dict[str, Any]]:

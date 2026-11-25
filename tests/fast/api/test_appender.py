@@ -675,7 +675,7 @@ class TestCustomColumns:
             pytest.param("NULL", duckdb.InvalidInputException, id="null_text"),
             pytest.param(SQLNULL, duckdb.InvalidInputException, id="null_sqltype"),
             pytest.param("no_such_type", duckdb.CatalogException, id="unknown"),
-            pytest.param("DECIMAL(40, 2)", duckdb.BinderException, id="out_of_range"),
+            pytest.param("DECIMAL(2000000, 2)", duckdb.BinderException, id="out_of_range"),
         ],
     )
     def test_a_type_that_cannot_hold_values_is_refused_at_creation(self, con, declared, error):
